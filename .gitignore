@@ -1,0 +1,18 @@
+# Python bytecode / cache
+__pycache__/
+*.py[cod]
+
+# Local runtime data - never commit VKs, configs, or logs
+*.log
+config.json
+vk
+vk.*
+
+# Windows junk
+Thumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# Editors / IDE
+.vscode/
+.idea/
