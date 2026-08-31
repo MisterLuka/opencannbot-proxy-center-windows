@@ -178,6 +178,12 @@ PowerShell 示例：
 
 卸载会删除整个安装目录，包括安装时自动下载到其中的 `opencannbot\` 仓库。使用 `-RepoDir` 指定的外部仓库不受影响。
 
+## 特别感谢
+
+本项目的核心代理能力来自关联项目 [OpenCANNBot](https://github.com/BadFatCat0919/opencannbot)，Proxy Center 在其之上提供 Windows 原生的多实例管理。感谢 OpenCANNBot 项目的所有贡献者：
+
+**仓库地址：<https://github.com/BadFatCat0919/opencannbot>**
+
 ## 许可证
 
 本项目基于 [MIT License](LICENSE) 发布。
