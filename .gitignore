@@ -16,3 +16,5 @@ $RECYCLE.BIN/
 # Editors / IDE
 .vscode/
 .idea/
+.claude/
+.opencode/
