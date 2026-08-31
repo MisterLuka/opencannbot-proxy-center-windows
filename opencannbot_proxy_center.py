@@ -55,10 +55,11 @@ OLD_VK_FILE = Path.home() / ".cannbot" / "vk"
 MAX_INSTANCES = 3
 DEFAULT_PORTS = (8766, 8767, 8768)
 DEFAULT_MODEL_OPTIONS: tuple[tuple[str, str], ...] = (
-    ("glm-5.2", "GLM 5.2"),
-    ("qwen3.7-max", "Qwen 3.7 Max"),
-    # The gateway accepts this lowercase model ID; the title is display-only.
-    ("deepseek-v4-flash-0731", "DeepSeek-V4-Flash-0731"),
+    ("glm-5.3", "GLM 5.3"),
+    ("glm-5.3-flash", "GLM 5.3 Flash"),
+    # The gateway accepts these lowercase model IDs; titles are display-only.
+    ("deepseek-v4-flash", "DeepSeek-V4-Flash"),
+    ("deepseek-v4-pro", "DeepSeek-V4-Pro"),
 )
 MODEL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$")
 MAX_MODELS = 100
@@ -167,7 +168,7 @@ def new_instance_record(index: int, *, instance_id: Optional[str] = None) -> dic
         "name": f"代理实例 {safe_index + 1}",
         "description": "为应用提供独立模型路由",
         "port": DEFAULT_PORTS[safe_index],
-        "model": "glm-5.2" if safe_index == 0 else "qwen3.7-max",
+        "model": "glm-5.3" if safe_index == 0 else "glm-5.3-flash",
         "log_level": "INFO",
         "keepalive_idle": 300,
         "socket_timeout": 30,
@@ -226,8 +227,8 @@ def migrate_legacy_config() -> Optional[dict[str, Any]]:
         first["port"] = int(legacy.get("proxy_port", 8766))
     except (TypeError, ValueError):
         pass
-    model = str(legacy.get("model", "glm-5.2"))
-    first["model"] = model if model in model_ids(default_models()) else "glm-5.2"
+    model = str(legacy.get("model", "glm-5.3"))
+    first["model"] = model if model in model_ids(default_models()) else "glm-5.3"
     first["log_level"] = str(legacy.get("log_level", "INFO")).upper()
     first["keepalive_idle"] = int(legacy.get("keepalive_idle", 300))
     first["socket_timeout"] = int(legacy.get("socket_timeout", 30))
@@ -1142,7 +1143,7 @@ def dashboard_page(config: dict[str, Any], message: str = "") -> str:
 <article class="instance-card {card_class}" data-instance-card="{esc(item['id'])}">
   <div class="instance-main">
     <div class="instance-title-row">
-      <div class="instance-name"><div class="instance-avatar {'qwen' if item['model']=='qwen3.7-max' else ''}">{esc(initials(item['name']))}</div><div><h3>{esc(item['name'])}</h3><p>{esc(item['description'] or '未填写用途说明')}</p></div></div>
+      <div class="instance-name"><div class="instance-avatar {'flash' if item['model'] in ('glm-5.3-flash', 'deepseek-v4-flash') else ''}">{esc(initials(item['name']))}</div><div><h3>{esc(item['name'])}</h3><p>{esc(item['description'] or '未填写用途说明')}</p></div></div>
       <span class="status-pill {status_class}" data-role="status">{status_text}</span>
     </div>
     <div class="instance-meta">
