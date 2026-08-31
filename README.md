@@ -137,6 +137,34 @@ PowerShell 示例：
 
 其他支持 Anthropic Messages API 和自定义 Base URL 的应用，也可以直接使用实例地址和对应 VK。
 
+## 通过 cc-switch 管理 Claude Code / Codex / OpenCode
+
+[cc-switch](https://github.com/farion1231/cc-switch) 是一个开源桌面应用，用于统一管理 Claude Code、Codex、OpenCode、Gemini CLI 等工具的 API 供应商配置，支持一键切换、系统托盘快速切换和用量统计。
+
+Proxy Center 的每个实例都是一个标准的 Anthropic Messages API 端点，可以直接作为 cc-switch 的自定义供应商接入：
+
+1. 在实例配置页查看实例端点（`http://127.0.0.1:<端口>`）和 VK
+2. 打开 cc-switch，点击右上角 **+** 添加供应商
+3. 创建自定义配置：
+   - 名称：如 `OpenCANNBot 实例 1`
+   - Base URL（端点）：`http://127.0.0.1:8766`
+   - API Key：填写该实例的 VK
+4. 保存后在供应商列表中点击「启用」即可切换
+
+各应用的接入方式：
+
+| 应用 | 接入方式 |
+|------|----------|
+| Claude Code | 直接接入，实例原生提供 Anthropic Messages API；cc-switch 对 Claude Code 支持热切换，无需重启 |
+| Codex | Codex 原生走 OpenAI Responses 协议，需在 cc-switch 中开启本地代理（格式转换）后接入 |
+| OpenCode | 添加 Anthropic 类型自定义供应商（npm 填 `@ai-sdk/anthropic`），Base URL 和 API Key 同上 |
+
+说明：
+
+- 实例的模型由端口固定路由，cc-switch 供应商配置里的模型名不影响实际路由，生效的始终是实例所选模型
+- 除 Claude Code 外，切换供应商后需重启对应 CLI 终端才会生效（以 cc-switch 文档为准）
+- 若同时使用 cc-switch 的本地代理，注意其监听端口不要与实例端口（默认 8766–8768）或控制面板端口 8788 冲突
+
 ## 数据位置
 
 ```text
