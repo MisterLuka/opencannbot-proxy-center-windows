@@ -19,6 +19,8 @@
     setText('job-percent', `${percent}%`);
     const bar = document.getElementById('job-progress');
     if (bar) bar.style.width = `${percent}%`;
+    const ring = document.querySelector('.restart-ring');
+    if (ring) ring.style.setProperty('--ring-progress', `${percent}%`);
     setText('job-chip', job.done ? (job.success ? '已完成' : '执行失败') : '正在执行');
     setText('job-title', job.title || '正在处理代理实例');
     setText('job-message', job.message || '请稍候');

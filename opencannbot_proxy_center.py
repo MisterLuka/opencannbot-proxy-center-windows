@@ -64,12 +64,25 @@ DEFAULT_MODEL_OPTIONS: tuple[tuple[str, str], ...] = (
 MODEL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$")
 MAX_MODELS = 100
 MODEL_LABEL_MAX_LENGTH = 80
+
+# Gateway model discovery. The OpenCANNBot proxy exchanges the VK for a JWT and
+# exposes the authorized model catalog on the same host as the gateway.
+MODELS_SYNC_TIMEOUT = 8
+MODELS_SYNC_PAGE_SIZE = 100
+MODELS_SYNC_MAX_PAGES = 20
+MODELS_SYNC_MAX_AGE = 24 * 3600
+MODELS_CACHE_FILE = APP_DIR / "models-cache.json"
+
 LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR")
 CSRF_TOKEN = secrets.token_urlsafe(32)
 PANEL_PORT = 8788
 CONFIG_LOCK = threading.RLock()
+CONFIG_WRITE_LOCK = threading.RLock()
 JOBS_LOCK = threading.RLock()
 JOBS: dict[str, dict[str, Any]] = {}
+MODELS_SYNC_LOCK = threading.RLock()
+JWT_LOCK = threading.RLock()
+JWT_CACHE: dict[str, dict[str, Any]] = {}
 INSTANCE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
 
 
@@ -142,10 +155,14 @@ def normalize_models(raw: Any) -> list[dict[str, Any]]:
         label = str(value.get("label", value.get("name", model_id))).strip()
         if not label:
             label = model_id
+        source = str(value.get("source", "custom")).strip().lower()
+        if source not in ("custom", "gateway"):
+            source = "custom"
         models.append({
             "id": model_id,
             "label": label[:MODEL_LABEL_MAX_LENGTH],
             "builtin": False,
+            "source": source,
         })
         seen.add(model_id)
         if len(models) >= MAX_MODELS:
@@ -1037,6 +1054,464 @@ def model_options(current: str, config: Optional[dict[str, Any]] = None) -> str:
     )
 
 
+# ---------------------------------------------------------------------------
+# Gateway model discovery
+# ---------------------------------------------------------------------------
+
+def get_mac_address() -> str:
+    """Return a stable MAC address for the VK->JWT exchange, or a placeholder."""
+    try:
+        mac_int = uuid.getnode()
+        if (mac_int >> 40) % 2 == 0:  # not a random address
+            return ":".join(
+                f"{(mac_int >> offset) & 0xff:02x}"
+                for offset in (40, 32, 24, 16, 8, 0)
+            )
+    except Exception:
+        pass
+    return "00:00:00:00:00:00"
+
+
+def gateway_endpoints(config: dict[str, Any]) -> tuple[str, str]:
+    """Read the model catalog and authentication endpoints from OpenCANNBot."""
+    repo = repo_state(config)
+    if not repo["ready"]:
+        raise ValueError("请在全局设置中配置有效的 OpenCANNBot 仓库，再同步模型")
+
+    try:
+        text = repo["source"].read_text(encoding="utf-8-sig")
+    except (OSError, UnicodeError) as exc:
+        raise ValueError("无法读取 OpenCANNBot 代理源码") from exc
+
+    gateway_match = re.search(r"""^GATEWAY_URL\s*=\s*["']([^"']+)["']""", text, re.MULTILINE)
+    if not gateway_match:
+        raise ValueError("OpenCANNBot 代理源码缺少 GATEWAY_URL，无法同步模型")
+    try:
+        gateway = urlparse(gateway_match.group(1).strip())
+    except ValueError as exc:
+        raise ValueError("OpenCANNBot 代理源码中的 GATEWAY_URL 无效") from exc
+    if gateway.scheme not in ("http", "https") or not gateway.hostname or gateway.username is not None:
+        raise ValueError("OpenCANNBot 代理源码中的 GATEWAY_URL 无效")
+
+    origin = f"{gateway.scheme}://{gateway.netloc}"
+    auth_url = origin + "/cannbot/api/auth/authenticate"
+    auth_match = re.search(r"""^AUTH_URL\s*=\s*["']([^"']+)["']""", text, re.MULTILINE)
+    if auth_match:
+        candidate = auth_match.group(1).strip()
+        try:
+            auth = urlparse(candidate)
+        except ValueError:
+            auth = None
+        if auth and (auth.scheme, auth.netloc) == (gateway.scheme, gateway.netloc):
+            auth_url = candidate
+        else:
+            panel_log("Ignoring AUTH_URL with a different or invalid origin")
+    return auth_url, origin + "/cannbot/api/models/list"
+
+
+def _jwt_cache_key(auth_url: str, vk: str) -> str:
+    return auth_url + "\n" + vk
+
+
+def exchange_vk_for_jwt(
+    vk: str,
+    auth_url: str,
+    timeout: float = MODELS_SYNC_TIMEOUT,
+    force: bool = False,
+) -> tuple[Optional[str], str]:
+    """Exchange a VK for a short-lived JWT (cached per auth host + VK)."""
+    now = time.time()
+    cache_key = _jwt_cache_key(auth_url, vk)
+    with JWT_LOCK:
+        cached = JWT_CACHE.get(cache_key)
+        if not force and cached and float(cached.get("expires", 0)) > now + 60:
+            return str(cached.get("token", "")), ""
+
+    body = json.dumps({"type": "cli", "mac": get_mac_address()}).encode("utf-8")
+    request = Request(auth_url, data=body, method="POST")
+    request.add_header("Content-Type", "application/json")
+    request.add_header("x-api-vkey", vk)
+    request.add_header("User-Agent", "OpenCANNBot-Proxy-Center/1.0")
+    try:
+        with urlopen(request, timeout=timeout) as response:
+            payload = json.loads(response.read().decode("utf-8", "replace"))
+    except HTTPError as exc:
+        try:
+            detail = exc.read().decode("utf-8", "replace")[:200]
+        except OSError:
+            detail = ""
+        return None, f"认证请求失败：HTTP {exc.code} {detail}".strip()
+    except (URLError, TimeoutError, OSError, ValueError) as exc:
+        return None, f"认证请求失败：{type(exc).__name__}: {exc}"
+
+    if not isinstance(payload, dict):
+        return None, "认证响应格式无法识别"
+    token = payload.get("accessToken") or payload.get("access_token")
+    if not token:
+        return None, "认证响应缺少 accessToken"
+    try:
+        expires_in = int(payload.get("expiresIn") or payload.get("expires_in") or 3600)
+    except (TypeError, ValueError):
+        expires_in = 3600
+    expires = now + max(120, expires_in) - 60
+    with JWT_LOCK:
+        JWT_CACHE[cache_key] = {"token": str(token), "expires": expires}
+    return str(token), ""
+
+
+def fetch_gateway_models(models_url: str, token: str, timeout: float = MODELS_SYNC_TIMEOUT) -> tuple[Optional[list[dict[str, Any]]], str]:
+    """Fetch every enabled model from the gateway model list API."""
+    discovered: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    page = 1
+    while page <= MODELS_SYNC_MAX_PAGES:
+        url = f"{models_url}?page={page}&size={MODELS_SYNC_PAGE_SIZE}"
+        request = Request(url)
+        request.add_header("Authorization", f"Bearer {token}")
+        request.add_header("Accept", "application/json")
+        request.add_header("User-Agent", "OpenCANNBot-Proxy-Center/1.0")
+        try:
+            with urlopen(request, timeout=timeout) as response:
+                payload = json.loads(response.read().decode("utf-8", "replace"))
+        except HTTPError as exc:
+            try:
+                detail = exc.read().decode("utf-8", "replace")[:200]
+            except OSError:
+                detail = ""
+            return None, f"模型列表请求失败：HTTP {exc.code} {detail}".strip()
+        except (URLError, TimeoutError, OSError, ValueError) as exc:
+            return None, f"模型列表请求失败：{type(exc).__name__}: {exc}"
+
+        if isinstance(payload, dict):
+            items = payload.get("models")
+            pages = payload.get("totalPages") or payload.get("total_pages") or 1
+        elif isinstance(payload, list):
+            items = payload
+            pages = 1
+        else:
+            return None, "模型列表响应格式无法识别"
+        if not isinstance(items, list):
+            return None, "模型列表响应缺少 models 字段"
+
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            status = item.get("status")
+            if status is not None and str(status).strip().lower() not in ("1", "true", "active"):
+                continue
+            model_id = str(item.get("model") or item.get("id") or "").strip()
+            if not MODEL_ID_RE.fullmatch(model_id) or model_id in seen:
+                continue
+            label = str(item.get("title") or item.get("name") or model_id).strip()
+            entry: dict[str, Any] = {
+                "id": model_id,
+                "label": (label or model_id)[:MODEL_LABEL_MAX_LENGTH],
+            }
+            for cache_key, source_key in (("context_length", "contextLength"), ("max_tokens", "maxTokens")):
+                value = item.get(source_key)
+                if isinstance(value, int):
+                    entry[cache_key] = value
+            discovered.append(entry)
+            seen.add(model_id)
+
+        try:
+            total_pages = int(pages)
+        except (TypeError, ValueError):
+            total_pages = 1
+        if total_pages <= 1 or page >= total_pages:
+            break
+        page += 1
+
+    if not discovered:
+        return None, "网关没有返回可用模型（当前 VK 可能未授权任何模型）"
+    return discovered, ""
+
+
+def configured_vk_candidates(config: dict[str, Any]) -> list[tuple[str, str]]:
+    """Return distinct instance VKs plus the legacy global VK as a fallback."""
+    candidates: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for instance in config.get("instances", []):
+        vk = read_instance_vk(str(instance["id"]))
+        if vk and vk not in seen:
+            candidates.append((vk, f"实例 {instance['name']}"))
+            seen.add(vk)
+    try:
+        global_vk = OLD_VK_FILE.read_text(encoding="utf-8-sig").strip()
+    except OSError:
+        global_vk = ""
+    if global_vk and global_vk not in seen:
+        candidates.append((global_vk, "全局 VK"))
+    return candidates
+
+
+def sync_models_from_gateway(config: dict[str, Any]) -> tuple[list[dict[str, Any]], str, bool]:
+    """Query every configured VK and return the union of their gateway catalogs.
+
+    The third value is True only when all VKs were queried successfully; callers
+    must not remove catalog entries when the result is incomplete.
+    """
+    candidates = configured_vk_candidates(config)
+    if not candidates:
+        raise ValueError("未找到可用的 VK，请先在实例配置中填写 VK")
+    auth_url, models_url = gateway_endpoints(config)
+    failures: list[str] = []
+    union: dict[str, dict[str, Any]] = {}
+    succeeded: list[str] = []
+    for vk, source_name in candidates:
+        token, error = exchange_vk_for_jwt(vk, auth_url)
+        models: Optional[list[dict[str, Any]]] = None
+        if token:
+            models, error = fetch_gateway_models(models_url, token)
+            if models is None and ("HTTP 401" in error or "HTTP 403" in error):
+                # The cached JWT was rejected; refresh it once and retry.
+                token, refresh_error = exchange_vk_for_jwt(vk, auth_url, force=True)
+                if token:
+                    models, error = fetch_gateway_models(models_url, token)
+                else:
+                    error = refresh_error or error
+        if models:
+            succeeded.append(source_name)
+            for item in models:
+                union.setdefault(str(item["id"]), item)
+        else:
+            failures.append(f"{source_name}：{error}")
+    if not union:
+        detail = "；".join(failures) if failures else "网关没有返回可用模型"
+        raise ValueError("从网关获取模型列表失败：" + detail)
+    if failures:
+        panel_log("Model sync partial failures: " + "；".join(failures))
+    if len(succeeded) <= 2:
+        source = "、".join(succeeded)
+    else:
+        source = f"{len(succeeded)} 个 VK"
+    return list(union.values()), source, not failures
+
+
+def read_models_cache() -> dict[str, Any]:
+    value = read_json(MODELS_CACHE_FILE)
+    return value if isinstance(value, dict) else {}
+
+
+def format_timestamp(value: Any) -> str:
+    try:
+        stamp = int(value)
+        if stamp <= 0:
+            return ""
+        return time.strftime("%Y-%m-%d %H:%M", time.localtime(stamp))
+    except (TypeError, ValueError, OSError, OverflowError):
+        return ""
+
+
+def _write_models_cache_payload(payload: dict[str, Any]) -> None:
+    try:
+        atomic_write(
+            MODELS_CACHE_FILE,
+            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+        )
+    except OSError as exc:
+        panel_log(f"Failed to write model cache: {type(exc).__name__}: {exc}")
+
+
+def write_models_cache(discovered: list[dict[str, Any]], source: str, *, complete: bool = True) -> None:
+    now = int(time.time())
+    _write_models_cache_payload({
+        "synced_at": now,
+        "last_attempt": now,
+        "last_error": "",
+        "source": source,
+        "complete": bool(complete),
+        "models": discovered,
+    })
+
+
+def record_sync_failure(message: str) -> None:
+    cache = read_models_cache()
+    cache["last_attempt"] = int(time.time())
+    cache["last_error"] = str(message)[:500]
+    if not isinstance(cache.get("models"), list):
+        cache["models"] = []
+    _write_models_cache_payload(cache)
+
+
+def merge_discovered_models(
+    config: dict[str, Any],
+    discovered: list[dict[str, Any]],
+    *,
+    prune_missing: bool = True,
+) -> dict[str, int]:
+    """Merge gateway models into the catalog, keeping built-in and manual entries.
+
+    When *prune_missing* is True (a complete sync) any model the gateway does not
+    provide is removed unless an instance still uses it. Manual entries that the
+    gateway does provide are kept with their custom label.
+    """
+    catalog = model_catalog(config)
+    discovered_map = {str(item["id"]): item for item in discovered}
+    used = {str(instance.get("model", "")) for instance in config.get("instances", [])}
+    merged: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    added = updated = removed = kept_stale = 0
+
+    for item in catalog:
+        model_id = str(item["id"])
+        if item.get("builtin"):
+            merged.append(item)
+            seen.add(model_id)
+            continue
+        source = str(item.get("source", "custom")).lower()
+        if model_id in discovered_map:
+            if source == "gateway":
+                entry = dict(item)
+                label = str(discovered_map[model_id].get("label", "")).strip()
+                if label and label != entry.get("label"):
+                    entry["label"] = label[:MODEL_LABEL_MAX_LENGTH]
+                    updated += 1
+                merged.append(entry)
+            else:
+                merged.append(item)
+            seen.add(model_id)
+            continue
+        if model_id in used or not prune_missing:
+            merged.append(item)
+            seen.add(model_id)
+            kept_stale += 1
+        else:
+            removed += 1
+
+    for item in discovered:
+        model_id = str(item["id"])
+        if model_id in seen or len(merged) >= MAX_MODELS:
+            continue
+        merged.append({
+            "id": model_id,
+            "label": str(item.get("label") or model_id)[:MODEL_LABEL_MAX_LENGTH],
+            "builtin": False,
+            "source": "gateway",
+        })
+        seen.add(model_id)
+        added += 1
+
+    config["models"] = merged
+    return {"added": added, "updated": updated, "removed": removed, "kept": kept_stale, "total": len(merged)}
+
+
+def gateway_unlisted_models(config: dict[str, Any], discovered_ids: set[str]) -> list[str]:
+    """Manual models that are absent from the gateway model list."""
+    return [
+        str(item["id"])
+        for item in model_catalog(config)
+        if not item.get("builtin")
+        and str(item.get("source", "custom")).lower() == "custom"
+        and str(item["id"]) not in discovered_ids
+    ]
+
+
+def sync_models_into_config() -> str:
+    """Fetch the gateway catalog, merge it into the config, and return a summary."""
+    with MODELS_SYNC_LOCK:
+        # Network calls happen outside config locks so status polling stays responsive.
+        snapshot = load_config()
+        try:
+            discovered, source, complete = sync_models_from_gateway(snapshot)
+        except ValueError as exc:
+            record_sync_failure(str(exc))
+            raise
+        with CONFIG_WRITE_LOCK, CONFIG_LOCK:
+            config = load_config()
+            stats = merge_discovered_models(config, discovered, prune_missing=complete)
+            save_config(config)
+            write_models_cache(discovered, source, complete=complete)
+    message = (
+        f"已从网关同步 {len(discovered)} 个模型（来源：{source}）："
+        f"新增 {stats['added']} 个、更新 {stats['updated']} 个"
+    )
+    if not complete:
+        message += "；部分 VK 同步失败，本次未移除网关未返回的模型"
+    if stats["removed"]:
+        message += f"、移除 {stats['removed']} 个网关未提供的模型"
+    if stats["kept"]:
+        if complete:
+            message += f"；{stats['kept']} 个网关未提供的模型仍被实例使用，暂未移除"
+        else:
+            message += f"；保留 {stats['kept']} 个网关未返回的旧模型"
+    return message
+
+
+def prune_unlisted_models(model_ids: Optional[set[str]] = None) -> str:
+    """Remove manual models that the gateway no longer lists (except in-use ones).
+
+    When *model_ids* is given, only that confirmed set is removed; this keeps the
+    POST bound to the IDs shown on the confirmation page.
+    """
+    with MODELS_SYNC_LOCK:
+        cache = read_models_cache()
+        cached_models = cache.get("models") if isinstance(cache.get("models"), list) else []
+        discovered_ids = {str(item.get("id", "")) for item in cached_models if isinstance(item, dict)}
+        if not discovered_ids:
+            raise ValueError("请先从网关同步模型列表，再清理未列出的模型")
+        if cache.get("complete") is False:
+            raise ValueError("上次同步未覆盖全部 VK，请重新同步后再清理")
+        try:
+            synced_at = int(cache.get("synced_at") or 0)
+        except (TypeError, ValueError):
+            synced_at = 0
+        if synced_at and time.time() - synced_at > MODELS_SYNC_MAX_AGE:
+            panel_log("Model cache is older than 24h; pruning may remove still-valid models")
+        removed: list[str] = []
+        blocked: list[str] = []
+        with CONFIG_WRITE_LOCK, CONFIG_LOCK:
+            config = load_config()
+            catalog = model_catalog(config)
+            used = {str(instance.get("model", "")) for instance in config.get("instances", [])}
+            kept: list[dict[str, Any]] = []
+            for item in catalog:
+                model_id = str(item["id"])
+                if item.get("builtin") or str(item.get("source", "custom")).lower() == "gateway":
+                    kept.append(item)
+                elif model_id in discovered_ids:
+                    kept.append(item)
+                elif model_id in used:
+                    blocked.append(model_id)
+                    kept.append(item)
+                elif model_ids is None or model_id in model_ids:
+                    removed.append(model_id)
+                else:
+                    kept.append(item)
+            if removed:
+                config["models"] = kept
+                save_config(config)
+    if not removed:
+        if blocked:
+            return f"没有可清理的模型：{len(blocked)} 个网关未列出的模型仍被实例使用，请先切换实例模型"
+        return "没有需要清理的模型：当前手动模型都在网关列表中"
+    message = f"已清理 {len(removed)} 个网关未列出的模型：{'、'.join(removed)}"
+    if blocked:
+        message += f"；{len(blocked)} 个模型仍被实例使用，未清理"
+    return message
+
+
+def auto_sync_models() -> None:
+    """Refresh the model catalog from the gateway in the background."""
+    try:
+        message = sync_models_into_config()
+    except ValueError as exc:
+        panel_log("Model auto-sync skipped: " + str(exc))
+        return
+    except Exception as exc:  # pragma: no cover - defensive
+        panel_log(f"Model auto-sync failed: {type(exc).__name__}: {exc}")
+        return
+    panel_log("Model auto-sync: " + message)
+
+
+def start_model_auto_sync() -> None:
+    def runner() -> None:
+        time.sleep(1.5)
+        auto_sync_models()
+
+    threading.Thread(target=runner, daemon=True, name="model-auto-sync").start()
+
+
 def log_level_options(current: str) -> str:
     return "".join(
         f'<option value="{level}" {"selected" if level == current else ""}>{level}</option>'
@@ -1084,7 +1559,7 @@ def page_shell(title: str, body: str, *, active: str = "instances", message: str
     script_tag = f'<script src="/static/{script}" defer></script>' if script else ""
     return f'''<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self'; script-src 'self'; connect-src 'self'; form-action 'self'; base-uri 'none'">
-<meta name="description" content="OpenCANNBot 本地代理实例控制中心"><meta name="theme-color" content="#123033">
+<meta name="description" content="OpenCANNBot 本地代理实例控制中心"><meta name="color-scheme" content="light"><meta name="theme-color" content="#f7f8fb">
 <title>{esc(title)}</title><link rel="stylesheet" href="/static/proxy_center.css">{script_tag}</head><body><a class="skip-link" href="#main-content">跳到主要内容</a><div class="app">{sidebar(active)}<main class="main" id="main-content" tabindex="-1">
 <header class="topbar"><div class="topbar-context"><div class="topbar-eyebrow">LOCAL CONTROL PLANE</div><div class="breadcrumb">OpenCANNBot / <strong>{esc(title)}</strong></div></div><div class="top-actions"><div class="topbar-status"><span class="topbar-status-dot"></span>本机服务</div><a class="btn secondary icon-btn" href="/settings" aria-label="打开全局设置" title="全局设置">⚙</a><form method="post" action="/system/exit"><input type="hidden" name="csrf" value="{CSRF_TOKEN}"><button class="btn secondary" type="submit" onclick="return confirm('将停止所有由代理中心管理的实例并完全退出，确定继续吗？')">完全退出</button></form></div></header>
 <div class="content">{toast_html(message)}{body}</div></main></div></body></html>'''
@@ -1224,7 +1699,7 @@ def instance_form_page(config: dict[str, Any], instance: Optional[dict[str, Any]
       </div></section>
       <section class="form-section"><div class="section-kicker">Routing</div><h3>端口与模型</h3><p>该端口会忽略客户端提交的其他模型名，并固定路由到所选模型。</p><div class="fields">
         <div class="field"><label for="port">监听端口</label><input id="port" type="number" min="1" max="65535" name="port" value="{int(draft['port'])}" required><small>默认建议使用 8766、8767、8768，不能与其他实例重复。</small></div>
-        <div class="field"><label for="model">固定模型</label><select id="model" name="model">{model_options(str(draft['model']), config)}</select><small>模型列表可在“模型配置”页面自行维护。</small></div>
+        <div class="field"><label for="model">固定模型</label><select id="model" name="model">{model_options(str(draft['model']), config)}</select><small>模型列表会自动从网关同步，也可在“模型配置”页面手动维护。</small></div>
       </div></section>
       <section class="form-section"><div class="section-kicker">Authentication</div><h3>实例认证</h3><p>VK 仅保存在当前用户目录，不会显示完整内容。</p><div class="fields">
         <div class="field full"><label for="vk">CANNBOT VK</label><input id="vk" type="password" name="vk" placeholder="{esc(mask_vk(vk)) if vk else 'vk-xxxxxxxxxxxxxxxx'}"><small>{'留空保留现有 VK。' if vk else '首次创建并启动前必须填写 VK。'}</small></div>
@@ -1260,27 +1735,140 @@ def logs_page(config: dict[str, Any]) -> str:
 
 def models_page(config: dict[str, Any], message: str = "") -> str:
     catalog = model_catalog(config)
+    cache = read_models_cache()
+    synced_label = format_timestamp(cache.get("synced_at"))
+    attempt_label = format_timestamp(cache.get("last_attempt"))
+    last_error = str(cache.get("last_error") or "").strip()
+    cached_models = cache.get("models") if isinstance(cache.get("models"), list) else []
+    cached_ids = {
+        str(item.get("id", ""))
+        for item in cached_models
+        if isinstance(item, dict)
+    }
+    sync_source = str(cache.get("source") or "").strip()
+    if synced_label:
+        sync_state = f"上次同步 {synced_label}，网关返回 {len(cached_ids)} 个模型"
+        sync_hint = f"同步来源：{sync_source}；网关模型会自动出现在实例的模型下拉列表中。"
+    else:
+        sync_state = "尚未同步"
+        sync_hint = "点击右侧按钮立即获取；代理中心每次启动时也会自动同步一次。"
+    if cache.get("complete") is False:
+        sync_hint += " 上次同步未覆盖全部 VK，下架模型已保留。"
+    sync_error_html = ""
+    if last_error:
+        sync_error_html = (
+            f'<small class="model-sync-error">最近一次同步失败'
+            f'{"（" + attempt_label + "）" if attempt_label else ""}：{esc(last_error)}；'
+            f'当前保留上次成功同步的列表。</small>'
+        )
+
+    unlisted = gateway_unlisted_models(config, cached_ids) if cached_ids else []
+    used_models = {str(instance.get("model", "")) for instance in config.get("instances", [])}
+    removable = [model_id for model_id in unlisted if model_id not in used_models]
+    prune_link = ""
+    if removable:
+        prune_link = f'<a class="btn secondary" href="/models/prune">清理未列出的模型（{len(removable)}）</a>'
+
+    builtin_count = sum(1 for item in catalog if item.get("builtin"))
+    gateway_count = sum(1 for item in catalog if not item.get("builtin") and str(item.get("source", "custom")).lower() == "gateway")
+    custom_count = len(catalog) - builtin_count - gateway_count
+
     rows: list[str] = []
     for item in catalog:
         model_id = str(item["id"])
         label = str(item["label"])
         usage = sum(1 for instance in config.get("instances", []) if instance.get("model") == model_id)
-        if item.get("builtin"):
-            actions = '<span class="model-badge builtin">内置模型</span>'
+        is_builtin = bool(item.get("builtin"))
+        source = str(item.get("source", "custom")).lower()
+        if is_builtin:
+            badge_class, badge_text = "builtin", "内置"
+        elif source == "gateway":
+            badge_class, badge_text = "gateway", "网关同步"
         else:
-            actions = f'''
-<form method="post" action="/models/save" class="model-inline-form"><input type="hidden" name="csrf" value="{CSRF_TOKEN}"><input type="hidden" name="model_id" value="{esc(model_id)}"><input name="label" maxlength="{MODEL_LABEL_MAX_LENGTH}" value="{esc(label)}" aria-label="{esc(model_id)} 显示名称"><button class="btn secondary small" type="submit">保存名称</button></form>
-<form method="post" action="/models/delete" class="model-delete-form"><input type="hidden" name="csrf" value="{CSRF_TOKEN}"><input type="hidden" name="model_id" value="{esc(model_id)}"><button class="btn danger small" type="submit" onclick="return confirm('确定删除模型 {esc(model_id)} 吗？')">删除</button></form>'''
+            badge_class, badge_text = "custom", "自定义"
+        usage_text = f"当前有 {usage} 个实例使用" if usage else "暂无实例使用"
+        if not is_builtin and cached_ids and model_id not in cached_ids:
+            usage_text += " · 网关列表未包含"
+        delete_form = f'''<form method="post" action="/models/delete" class="model-delete-form"><input type="hidden" name="csrf" value="{CSRF_TOKEN}"><input type="hidden" name="model_id" value="{esc(model_id)}"><button class="btn danger small" type="submit" onclick="return confirm('确定删除模型 {esc(model_id)} 吗？')">删除</button></form>'''
+        if is_builtin:
+            actions = '<span class="model-badge builtin">内置模型</span>'
+        elif source == "gateway":
+            actions = delete_form
+        else:
+            save_form = f'''<form method="post" action="/models/save" class="model-inline-form"><input type="hidden" name="csrf" value="{CSRF_TOKEN}"><input type="hidden" name="model_id" value="{esc(model_id)}"><input name="label" maxlength="{MODEL_LABEL_MAX_LENGTH}" value="{esc(label)}" aria-label="{esc(model_id)} 显示名称"><button class="btn secondary small" type="submit">保存名称</button></form>'''
+            actions = save_form + delete_form
         rows.append(f'''
-<div class="model-row"><div class="model-row-info"><div class="model-row-title"><code>{esc(model_id)}</code><span class="model-badge {'builtin' if item.get('builtin') else 'custom'}">{'内置' if item.get('builtin') else '自定义'}</span></div><strong>{esc(label)}</strong><p>{'当前有 ' + str(usage) + ' 个实例使用' if usage else '暂无实例使用'}</p></div><div class="model-row-actions">{actions}</div></div>''')
+<div class="model-row"><div class="model-row-info"><div class="model-row-title"><code>{esc(model_id)}</code><span class="model-badge {badge_class}">{badge_text}</span></div><strong>{esc(label)}</strong><p>{usage_text}</p></div><div class="model-row-actions">{actions}</div></div>''')
 
     body = f'''
 <section class="page-head"><div><h1>模型配置</h1><p>管理实例可选的模型路由。模型 ID 会原样发送到 OpenCANNBot 网关。</p></div><div class="top-actions"><a class="btn secondary" href="/">返回代理实例</a><a class="btn secondary" href="/settings">全局设置</a></div></section>
+<section class="panel model-sync-panel">
+  <div class="panel-head"><div><h2>网关模型同步</h2><p>直接读取 OpenCANNBot 网关的模型配置，自动更新可选模型，无需手动填写模型 ID。</p></div><span class="model-badge gateway">自动</span></div>
+  <div class="panel-body model-sync-body">
+    <div class="model-sync-state"><strong>{sync_state}</strong><small>{esc(sync_hint)}</small>{sync_error_html}</div>
+    <div class="top-actions">
+      <form method="post" action="/models/sync"><input type="hidden" name="csrf" value="{CSRF_TOKEN}"><button class="btn primary" type="submit">从网关同步模型</button></form>
+      {prune_link}
+    </div>
+  </div>
+  <div class="model-sync-note"><div class="notice"><span>ⓘ</span><span>同步使用实例中已配置的 VK（没有实例 VK 时回退到全局 VK）调用网关接口，只加入状态为启用的模型；网关未提供的模型会在同步成功后自动移除（仍被实例使用的除外）。每次启动代理中心也会自动同步一次。</span></div></div>
+</section>
 <div class="model-admin-grid">
-  <section class="panel"><div class="panel-head"><div><h2>添加自定义模型</h2><p>填写网关实际接受的模型 ID，不要填写展示名称。</p></div></div><form method="post" action="/models/save" class="panel-body"><input type="hidden" name="csrf" value="{CSRF_TOKEN}"><div class="fields"><div class="field"><label for="model_id">模型 ID</label><input id="model_id" name="model_id" maxlength="128" pattern="[A-Za-z0-9][A-Za-z0-9._:/-]*" placeholder="例如 custom-model-v1" required><small>只能使用字母、数字、点、下划线、冒号、斜线和连字符。</small></div><div class="field"><label for="model_label">显示名称</label><input id="model_label" name="label" maxlength="{MODEL_LABEL_MAX_LENGTH}" placeholder="例如 Custom Model V1"><small>显示在实例配置和快速切换列表中。</small></div></div><div class="notice"><span>ⓘ</span><span>新增模型不会绕过网关权限；模型必须已被你的 VK 授权。保存后请在实例页面选择并重启。</span></div><div class="top-actions" style="margin-top:16px"><button class="btn primary" type="submit">添加模型</button></div></form></section>
-  <section class="panel"><div class="panel-head"><div><h2>可用模型</h2><p>{len(catalog)} 个模型，其中内置模型不可删除。</p></div></div><div class="model-list">{''.join(rows)}</div></section>
+  <section class="panel"><div class="panel-head"><div><h2>添加自定义模型</h2><p>填写网关实际接受的模型 ID，不要填写展示名称。</p></div></div><form method="post" action="/models/save" class="panel-body"><input type="hidden" name="csrf" value="{CSRF_TOKEN}"><div class="fields"><div class="field"><label for="model_id">模型 ID</label><input id="model_id" name="model_id" maxlength="128" pattern="[A-Za-z0-9][A-Za-z0-9._:/-]*" placeholder="例如 custom-model-v1" required><small>只能使用字母、数字、点、下划线、冒号、斜线和连字符。</small></div><div class="field"><label for="model_label">显示名称</label><input id="model_label" name="label" maxlength="{MODEL_LABEL_MAX_LENGTH}" placeholder="例如 Custom Model V1"><small>显示在实例配置和快速切换列表中。</small></div></div><div class="notice"><span>ⓘ</span><span>新增模型不会绕过网关权限；模型必须已被你的 VK 授权。保存后请在实例页面选择并重启。</span></div><div class="top-actions form-actions"><button class="btn primary" type="submit">添加模型</button></div></form></section>
+  <section class="panel"><div class="panel-head"><div><h2>可用模型</h2><p>{len(catalog)} 个模型：{builtin_count} 个内置、{gateway_count} 个网关同步、{custom_count} 个手动添加。</p></div></div><div class="model-list">{''.join(rows)}</div></section>
 </div>'''
     return page_shell("模型配置", body, active="models", message=message)
+
+
+def prune_confirm_page(config: dict[str, Any], message: str = "") -> str:
+    cache = read_models_cache()
+    cached_models = cache.get("models") if isinstance(cache.get("models"), list) else []
+    cached_ids = {
+        str(item.get("id", ""))
+        for item in cached_models
+        if isinstance(item, dict)
+    }
+    back_link = '<a class="btn secondary" href="/models">返回模型配置</a>'
+    if not cached_ids:
+        body = f'''<section class="page-head"><div><h1>清理未列出的模型</h1><p>需要先完成一次网关同步才能识别不在网关列表中的模型。</p></div>{back_link}</section>
+<div class="toast error"><strong>!</strong><span>尚未获取网关模型列表，请先在“模型配置”页面点击“从网关同步模型”。</span></div>'''
+        return page_shell("清理未列出的模型", body, active="models", message=message)
+    if cache.get("complete") is False:
+        body = f'''<section class="page-head"><div><h1>清理未列出的模型</h1><p>上次同步未覆盖全部 VK，无法确定哪些模型真正下架。</p></div>{back_link}</section>
+<div class="toast error"><strong>!</strong><span>上次同步不完整（部分 VK 查询失败），请先在“模型配置”页面重新同步，再进行清理。</span></div>'''
+        return page_shell("清理未列出的模型", body, active="models", message=message)
+
+    catalog = model_catalog(config)
+    labels = {str(item["id"]): str(item["label"]) for item in catalog}
+    used = {str(instance.get("model", "")) for instance in config.get("instances", [])}
+    unlisted = gateway_unlisted_models(config, cached_ids)
+    removable = [model_id for model_id in unlisted if model_id not in used]
+    blocked = [model_id for model_id in unlisted if model_id in used]
+    rows = "".join(
+        f'<div class="model-row"><div class="model-row-info"><div class="model-row-title"><code>{esc(model_id)}</code><span class="model-badge custom">手动添加</span></div><strong>{esc(labels.get(model_id, model_id))}</strong></div></div>'
+        for model_id in removable
+    )
+    if not rows:
+        rows = '<div class="model-row"><div class="model-row-info"><p>没有可清理的模型。</p></div></div>'
+    blocked_html = ""
+    if blocked:
+        blocked_html = f'<div class="notice"><span>ⓘ</span><span>{len(blocked)} 个模型不在网关列表中但仍被实例使用，已跳过：{esc("、".join(blocked))}</span></div>'
+    stale_html = ""
+    synced_label = format_timestamp(cache.get("synced_at"))
+    try:
+        synced_at = int(cache.get("synced_at") or 0)
+    except (TypeError, ValueError):
+        synced_at = 0
+    if synced_at and time.time() - synced_at > MODELS_SYNC_MAX_AGE:
+        stale_html = f'<div class="notice"><span>ⓘ</span><span>上次同步时间为 {esc(synced_label or "未知")}，已超过 24 小时；建议先回到“模型配置”重新同步，确认模型确实下架后再清理。</span></div>'
+    form_html = ""
+    if removable:
+        form_html = f'''<form method="post" action="/models/prune"><input type="hidden" name="csrf" value="{CSRF_TOKEN}"><input type="hidden" name="model_ids" value="{esc(",".join(removable))}"><div class="top-actions form-actions"><a class="btn secondary" href="/models">取消</a><button class="btn danger" type="submit">确认清理这 {len(removable)} 个模型</button></div></form>'''
+    heading = f"将删除 {len(removable)} 个模型" if removable else "没有可清理的模型"
+    body = f'''
+<section class="page-head"><div><h1>清理未列出的模型</h1><p>以下手动模型不在最近一次网关同步结果中，可能已下架或未被当前 VK 授权。</p></div>{back_link}</section>
+<section class="panel"><div class="panel-head"><div><h2>{heading}</h2><p>内置模型和网关同步模型不会被删除；被实例使用的模型会自动跳过。</p></div></div><div class="model-list">{rows}</div><div class="panel-body">{stale_html}{blocked_html}{form_html}</div></section>'''
+    return page_shell("清理未列出的模型", body, active="models", message=message)
 
 
 def settings_page(config: dict[str, Any], message: str = "") -> str:
@@ -1288,7 +1876,7 @@ def settings_page(config: dict[str, Any], message: str = "") -> str:
     body = f'''
 <section class="page-head"><div><h1>全局设置</h1><p>配置 OpenCANNBot 仓库位置和查看代理中心运行目录。</p></div><div class="top-actions"><a class="btn secondary" href="/models">模型配置</a><a class="btn secondary" href="/">返回代理实例</a></div></section>
 <div class="settings-grid">
-  <form method="post" action="/settings" class="panel"><input type="hidden" name="csrf" value="{CSRF_TOKEN}"><div class="panel-head"><div><h2>OpenCANNBot 项目</h2><p>代理中心会调用仓库中的 cannbot-claude-proxy.py。</p></div></div><div class="panel-body"><div class="field"><label for="repo_dir">仓库根目录</label><input id="repo_dir" name="repo_dir" value="{esc(config.get('repo_dir',''))}" placeholder="C:\\Projects\\opencannbot" required><small>保存时会检查文件是否存在。</small></div><div class="notice"><span>ⓘ</span><span>修改仓库位置不会自动重启现有实例。请分别重启需要应用新代码的实例。</span></div><div class="top-actions" style="margin-top:16px"><button class="btn primary" type="submit">保存全局设置</button></div></div></form>
+  <form method="post" action="/settings" class="panel"><input type="hidden" name="csrf" value="{CSRF_TOKEN}"><div class="panel-head"><div><h2>OpenCANNBot 项目</h2><p>代理中心会调用仓库中的 cannbot-claude-proxy.py。</p></div></div><div class="panel-body"><div class="field"><label for="repo_dir">仓库根目录</label><input id="repo_dir" name="repo_dir" value="{esc(config.get('repo_dir',''))}" placeholder="C:\\Projects\\opencannbot" required><small>保存时会检查文件是否存在。</small></div><div class="notice"><span>ⓘ</span><span>修改仓库位置不会自动重启现有实例。请分别重启需要应用新代码的实例。</span></div><div class="top-actions form-actions"><button class="btn primary" type="submit">保存全局设置</button></div></div></form>
   <aside class="panel"><div class="panel-head"><div><h2>运行信息</h2><p>排查安装、数据和日志位置。</p></div></div><div class="panel-body"><div class="preview-row"><span>仓库状态</span><strong>{'已就绪' if state['ready'] else '未就绪'}</strong></div><div class="preview-row"><span>实例上限</span><strong>{MAX_INSTANCES}</strong></div><div class="preview-row"><span>页面端口</span><strong>{PANEL_PORT}</strong></div><div class="field"><label>程序目录</label><div class="path-card">{esc(PROGRAM_DIR)}</div></div><div class="field"><label>数据目录</label><div class="path-card">{esc(APP_DIR)}</div></div><div class="field"><label>面板日志</label><div class="path-card">{esc(PANEL_LOG_FILE)}</div></div></div></aside>
 </div>'''
     return page_shell("全局设置", body, active="settings", message=message)
@@ -1303,7 +1891,7 @@ def restart_page(job: dict[str, Any]) -> str:
         f'''<div class="timeline-item {'done' if step.get('state')=='done' else 'active' if step.get('state')=='active' else ''}" data-step-index="{index}"><div class="step-circle">{index+1}</div><div><h3>{esc(step.get('label',''))}</h3><p data-role="step-detail">{esc(step.get('detail',''))}</p></div><span class="step-state" data-role="step-state">{esc(step.get('state_label','等待中'))}</span></div>'''
         for index, step in enumerate(job.get("steps", []))
     )
-    body = f'''<div class="restart-shell" data-job-id="{esc(job['id'])}"><section class="restart-card" id="restart-card"><div class="restart-head"><div class="restart-ring"><span id="job-percent">{int(job.get('progress',0))}%</span></div><div><h1 id="job-title">{esc(job.get('title','正在重启代理实例'))}</h1><p id="job-message">{esc(job.get('message','请稍候'))}</p></div><span class="restart-chip" id="job-chip">正在执行</span></div><div class="restart-body"><div class="timeline">{steps}<div class="job-error" id="job-error"></div></div><aside class="restart-side"><h3>任务详情</h3><div class="restart-meta"><div><span>实例</span><strong>{esc(job.get('instance_name',''))}</strong></div><div><span>监听端口</span><strong>{esc(port)}</strong></div><div><span>目标模型</span><strong>{esc(model)}</strong></div><div><span>已用时间</span><strong id="job-duration">0.0 秒</strong></div></div><div class="log-box" id="job-log">等待任务日志...</div></aside></div><div class="restart-foot"><span>成功后将自动返回代理中心。</span><div class="restart-actions"><a class="btn secondary hidden" id="job-retry" href="/">返回代理中心</a><div class="progress"><i id="job-progress" style="width:{int(job.get('progress',0))}%"></i></div></div></div></section></div>'''
+    body = f'''<div class="restart-shell" data-job-id="{esc(job['id'])}"><section class="restart-card" id="restart-card"><div class="restart-head"><div class="restart-ring"><span id="job-percent">{int(job.get('progress',0))}%</span></div><div><h1 id="job-title">{esc(job.get('title','正在重启代理实例'))}</h1><p id="job-message">{esc(job.get('message','请稍候'))}</p></div><span class="restart-chip" id="job-chip">正在执行</span></div><div class="restart-body"><div class="timeline">{steps}<div class="job-error" id="job-error"></div></div><aside class="restart-side"><h3>任务详情</h3><div class="restart-meta"><div><span>实例</span><strong>{esc(job.get('instance_name',''))}</strong></div><div><span>监听端口</span><strong>{esc(port)}</strong></div><div><span>目标模型</span><strong>{esc(model)}</strong></div><div><span>已用时间</span><strong id="job-duration">0.0 秒</strong></div></div><div class="log-box" id="job-log">等待任务日志...</div></aside></div><div class="restart-foot"><span>成功后将自动返回代理中心。</span><div class="restart-actions"><a class="btn secondary hidden" id="job-retry" href="/">返回代理中心</a><div class="progress"><i id="job-progress"></i></div></div></div></section></div>'''
     return page_shell("实例任务", body, active="instances", script="job.js")
 
 
@@ -1397,6 +1985,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/models":
             self.send_text(models_page(config, message))
             return
+        if path == "/models/prune":
+            self.send_text(prune_confirm_page(config, message))
+            return
         if path == "/settings":
             self.send_text(settings_page(config, message))
             return
@@ -1449,6 +2040,18 @@ class Handler(BaseHTTPRequestHandler):
         self.send_text("404", 404, "text/plain; charset=utf-8")
 
     def do_POST(self) -> None:
+        # Serialize read-modify-write requests with the background model sync so
+        # a stale handler snapshot cannot drop newly synced models. Sync/prune
+        # take their own locks (MODELS_SYNC_LOCK before CONFIG_WRITE_LOCK) to
+        # keep a single global lock order and avoid deadlocks.
+        path = unquote(urlparse(self.path).path)
+        if path in ("/models/sync", "/models/prune"):
+            self._handle_post()
+        else:
+            with CONFIG_WRITE_LOCK:
+                self._handle_post()
+
+    def _handle_post(self) -> None:
         parsed = urlparse(self.path)
         path = unquote(parsed.path)
         try:
@@ -1465,6 +2068,21 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/models/delete":
                 message = remove_model(config, form.get("model_id", "").strip())
                 save_config(config)
+                self.redirect("/models?message=" + quote(message))
+                return
+
+            if path == "/models/sync":
+                message = sync_models_into_config()
+                self.redirect("/models?message=" + quote(message))
+                return
+
+            if path == "/models/prune":
+                confirmed = {
+                    value.strip()
+                    for value in form.get("model_ids", "").split(",")
+                    if value.strip()
+                }
+                message = prune_unlisted_models(confirmed or None)
                 self.redirect("/models?message=" + quote(message))
                 return
 
@@ -1633,6 +2251,9 @@ def main() -> None:
     server = ThreadingHTTPServer(("127.0.0.1", PANEL_PORT), Handler)
     server.daemon_threads = True
     panel_log(f"Proxy center started at http://127.0.0.1:{PANEL_PORT}")
+    # Refresh the model catalog from the gateway on startup so new models are
+    # selectable without editing the configuration by hand.
+    start_model_auto_sync()
     try:
         server.serve_forever()
     except KeyboardInterrupt:

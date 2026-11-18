@@ -2,9 +2,14 @@
 __pycache__/
 *.py[cod]
 
-# Local runtime data - never commit VKs, configs, or logs
+# Local runtime data
+.cannbot/
+instances/
 *.log
+claude-panel.json
 config.json
+models-cache.json
+pid.json
 vk
 vk.*
 
