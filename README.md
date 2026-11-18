@@ -1,232 +1,139 @@
 # OpenCANNBot Proxy Center v6
 
-Windows 原生多实例代理中心，使用 Python 标准库运行，不需要 Flask、WSL 或 Git Bash。
+在 Windows 上用浏览器管理最多 3 个 OpenCANNBot 代理实例。每个实例使用独立端口和 VK，并将客户端请求固定路由到所选模型。
 
 ## 功能
 
-- 最多创建 3 个独立代理实例
-- 每个实例独立保存：
-  - 监听端口
-  - 固定模型路由
-  - VK
-  - PID
-  - 运行目录
-  - 日志
-- 支持模型：
-  - `glm-5.3`
-  - `glm-5.3-flash`
-  - `deepseek-v4-flash`（显示名：DeepSeek-V4-Flash）
-  - `deepseek-v4-pro`（显示名：DeepSeek-V4-Pro）
-- 模型列表自动从网关同步：启动时自动拉取当前 VK 可用的模型，也可在“模型配置”页面手动同步，无需再手工填写模型 ID
-- 页面提供“模型配置”，可查看网关同步模型、添加自定义模型、清理网关未列出的模型
-- 同一应用即使提交其他模型名，也会被实例端口固定路由到所选模型
-- 快速切换模型后自动停止、启动并执行健康检查
-- 专用重启等待页，显示每个执行阶段和实时日志
-- 静默启动，不常驻 CMD 或 PowerShell 窗口
-- 页面“完全退出”会停止全部由代理中心管理的实例并退出页面进程
-- 只监听 `127.0.0.1`
+- 在控制面板查看实例状态、复制连接地址、启停实例和查看运行日志。
+- 每个实例独立保存 VK、运行目录和 PID。控制面板和受管理的实例均监听 `127.0.0.1`。
+- 在首页快速切换模型。后台任务页显示启动、重启、健康检查进度和实时日志。
+- 自动从网关同步可用模型，也可在「模型配置」中添加模型和管理显示名称。
 
 ## 安装
 
-最简安装（自动下载关联项目）：
+需要 Windows 和 Python 3.8 或更高版本。确保终端中可以运行 `py -3` 或 `python`。代理中心使用 Python 标准库。
+
+[下载本项目 ZIP](https://github.com/MisterLuka/opencannbot-proxy-center-windows/archive/refs/heads/main.zip) 并解压，在项目目录运行以下命令。也可在 PowerShell 中运行 `.\install.ps1`。
 
 ```powershell
-.\install.ps1
+.\install.cmd
 ```
 
-未提供 `-RepoDir` 时，安装器会自动获取关联项目 [BadFatCat0919/opencannbot](https://github.com/BadFatCat0919/opencannbot)：优先使用 `git clone`，本机没有 Git 时自动回退为 zip 下载。下载位置为安装目录内的 `opencannbot\` 子目录；如该目录已存在有效仓库则直接复用，不会重复下载。
+默认安装目录为 `%LOCALAPPDATA%\OpenCANNBotProxyCenter`。安装器会在该目录下的 `opencannbot` 子目录准备关联项目，已有有效仓库时直接复用。有 Git 时使用 `git clone`，没有 Git 时下载 ZIP。[OpenCANNBot 上游项目](https://github.com/BadFatCat0919/opencannbot)
 
-所有参数均可选：
+使用现成的 OpenCANNBot 仓库时，将 `-RepoDir` 指向包含 `cannbot-claude-proxy.py` 的目录。可用 `-InstallDir` 选择程序安装目录。
 
 ```powershell
-.\install.ps1 `
-  -InstallDir "C:\Tools\OpenCANNBotProxyCenter"
-```
-
-使用已有的 opencannbot 仓库（不下载、不修改你的 Git 仓库）：
-
-```powershell
-.\install.ps1 `
-  -RepoDir "C:\Projects\opencannbot" `
-  -InstallDir "C:\Tools\OpenCANNBotProxyCenter"
-```
-
-也可以使用 CMD（参数同样全部可选）：
-
-```cmd
-install.cmd
-install.cmd -InstallDir "C:\Tools\OpenCANNBotProxyCenter"
-install.cmd -RepoDir "C:\Projects\opencannbot" -Overwrite
-```
-
-省略 `-InstallDir` 时，默认安装到：
-
-```text
-%LOCALAPPDATA%\OpenCANNBotProxyCenter
-```
-
-覆盖已有安装时使用 `-Overwrite`。该操作会停止旧代理进程并覆盖程序文件，但会保留 `%USERPROFILE%\.cannbot\proxy-center` 下的配置、VK 和日志：
-
-```powershell
-.\install.ps1 `
-  -InstallDir "C:\Tools\OpenCANNBotProxyCenter" `
-  -Overwrite
+.\install.ps1 -RepoDir "C:\Projects\opencannbot" -InstallDir "C:\Tools\OpenCANNBotProxyCenter"
 ```
 
 ## 静默启动
 
-双击：
+安装完成后，双击安装目录中的 `start-proxy-center.vbs`。也可运行同目录的 `start-proxy-center.cmd`。控制面板地址为 [http://127.0.0.1:8788](http://127.0.0.1:8788)。
 
-```text
-C:\Tools\OpenCANNBotProxyCenter\start-proxy-center.vbs
-```
+### 首次配置
 
-或者：
+1. 全新安装会创建「默认代理」。在「代理实例」打开该实例的「配置」，填入有网关权限的 `CANNBOT VK`。
+2. 如果目标模型还未出现在下拉列表，先点击「仅保存」，再前往「模型配置」点击「从网关同步模型」。
+3. 在实例配置中选择固定模型，点击「保存并重启」，等待健康检查通过。
+4. 在客户端填写实例卡片上的 Base URL，使用该实例的 VK 作为 API Key。默认实例的地址为 `http://127.0.0.1:8766`。
 
-```powershell
-wscript.exe "C:\Tools\OpenCANNBotProxyCenter\start-proxy-center.vbs"
-```
+安装时已登记关联仓库。移动或更换仓库后，在「全局设置」中更新目录，再分别重启需要使用新仓库的实例。
 
-浏览器打开：
-
-```text
-http://127.0.0.1:8788
-```
+页面打不开时，在安装目录运行 `.\proxy-center.cmd` 查看启动输出。「完全退出」会停止代理中心管理的全部实例并关闭控制面板服务。
 
 ## 多实例示例
 
-```text
-实例 1
-端口：8766
-模型：glm-5.3
-用途：Claude Code
+| 用途 | Base URL | 固定模型 |
+| --- | --- | --- |
+| Claude Code | `http://127.0.0.1:8766` | `glm-5.3` |
+| 桌面助手 | `http://127.0.0.1:8767` | `glm-5.3-flash` |
 
-实例 2
-端口：8767
-模型：glm-5.3-flash
-用途：桌面助手
-```
+实例的建议端口为 `8766`、`8767`、`8768`。各客户端使用对应实例的 Base URL 和 VK。代理会将请求中的模型替换为该实例配置的固定模型。
 
-两个应用分别填写不同的 Base URL：
-
-```text
-http://127.0.0.1:8766
-http://127.0.0.1:8767
-```
-
-每个实例的模型由代理层固定，不依赖客户端是否正确保存模型设置。
+在首页的「快速切换模型」中选择模型，再点击「应用并重启」或「应用并启动」即可生效。
 
 ## 模型配置
 
-打开代理中心左侧的“模型配置”页面即可维护模型列表。模型列表会从 OpenCANNBot 网关自动同步，不需要再手工维护模型名称：
+代理中心每次启动时会尝试同步一次。也可以在「模型配置」点击「从网关同步模型」。同步会收集各实例的 VK 及可用的旧版全局 VK（`%USERPROFILE%\.cannbot\vk`），去重后逐个查询并合并返回的已启用模型。每个实例只能调用其 VK 已获授权的模型。
 
-1. 代理中心每次启动时会在后台自动同步一次；也可以点击“从网关同步模型”立即刷新。
-2. 同步会使用实例中已配置的 VK（没有实例 VK 时回退到全局 VK `%USERPROFILE%\.cannbot\vk`）调用网关的模型列表接口，只加入状态为启用的模型，并自动写入模型显示名称。
-3. 如果多个实例配置了不同 VK，会合并所有 VK 能看到的模型；只要有任一 VK 查询失败，本次同步就视为不完整，不会删除网关未返回的模型。
-4. 同步得到的模型会立即出现在实例配置和首页“快速切换模型”的下拉列表中，选择后重启实例即可生效。
-5. 网关未提供的模型（包括历史手动添加的模型）会在同步成功后自动从列表移除；仍被实例使用的模型会保留，避免实例配置失效。
-6. 被实例使用的失效模型会在页面标记“网关列表未包含”，切换实例模型后可点击“清理未列出的模型”手动清掉。清理操作有独立确认页且只删除确认页列出的模型；同步不完整或缓存超过 24 小时时页面会给出提示/拦截。
-7. 手动删除的“网关同步”模型如果仍在网关列表中，下次同步时会重新出现；要长期隐藏某个模型，需要网关侧停用它。
-8. 同步失败（例如离线、VK 无权限）时保留现有模型列表，并把最近一次失败时间和原因显示在“模型配置”页面顶部。
+| 同步结果 | 模型列表处理 |
+| --- | --- |
+| 全部 VK 查询成功 | 加入或更新网关模型。移除网关未返回且未被实例使用的非内置模型，包括符合条件的手动条目。 |
+| 部分 VK 查询成功 | 合并成功返回的模型，保留现有条目。 |
+| 同步失败 | 保留现有列表，并在「模型配置」显示失败时间和原因。 |
 
-内置模型（GLM 5.3、GLM 5.3 Flash、DeepSeek-V4-Flash、DeepSeek-V4-Pro）作为网关不可用时的后备项保留，不可删除。
+已同步的模型会出现在实例配置和首页的模型下拉列表里。内置模型始终可选，分别为 `glm-5.3`、`glm-5.3-flash`、`deepseek-v4-flash` 和 `deepseek-v4-pro`。
 
-模型必须同时获得当前 VK 的网关授权，页面保存配置不会绕过网关权限。同步失败时（例如离线、VK 无权限）会保留现有模型列表，并在页面提示失败原因。
+手动添加模型时，使用网关实际接受的模型 ID。若删除了仍在网关列表中的同步模型，下次同步会重新加入它。
 
-代理中心从关联仓库的 `cannbot-claude-proxy.py` 读取 `GATEWAY_URL`。模型列表接口使用该网关的同源地址，认证优先采用同源的 `AUTH_URL`，否则使用默认认证路径。请在“全局设置”中选择有效的 OpenCANNBot 仓库后同步模型。
+「清理未列出的模型」用于确认并删除网关未列出、当前也没有实例使用的手动条目。执行前需要有一次覆盖全部 VK 的同步结果。缓存超过 24 小时时，页面会提示先重新同步。
+
+网关地址从关联仓库的 `cannbot-claude-proxy.py` 中读取 `GATEWAY_URL`。模型列表与默认认证使用同源地址。上游定义了同源的 `AUTH_URL` 时，优先使用该认证地址。
 
 ## Claude Code 接入
 
-每个实例会生成独立启动脚本：
-
-```text
-%USERPROFILE%\.cannbot\proxy-center\instances\<实例ID>\claude-code.ps1
-%USERPROFILE%\.cannbot\proxy-center\instances\<实例ID>\claude-code.cmd
-```
-
-PowerShell 示例：
+每个实例都会生成 `claude-code.ps1` 和 `claude-code.cmd`。启动脚本会为 Claude Code 设置实例的 Base URL、VK 和模型。以默认实例为例，可在 PowerShell 中运行以下命令。
 
 ```powershell
-& "$HOME\.cannbot\proxy-center\instances\proxy-default\claude-code.ps1"
+& "$env:USERPROFILE\.cannbot\proxy-center\instances\proxy-default\claude-code.ps1"
 ```
 
-其他支持 Anthropic Messages API 和自定义 Base URL 的应用，也可以直接使用实例地址和对应 VK。
+其他实例的脚本位于 `%USERPROFILE%\.cannbot\proxy-center\instances\<实例ID>\`。支持 Anthropic Messages API 的其他客户端也可以使用实例地址和 VK。
 
 ## 通过 cc-switch 管理 Claude Code / Codex / OpenCode
 
-[cc-switch](https://github.com/farion1231/cc-switch) 是一个开源桌面应用，用于统一管理 Claude Code、Codex、OpenCode、Gemini CLI 等工具的 API 供应商配置，支持一键切换、系统托盘快速切换和用量统计。
+在 CC Switch 中选择客户端并添加自定义供应商。API Key 填该实例的 VK，模型选择对应实例的固定模型。以下示例使用默认实例的端口 `8766`。[CC Switch 项目](https://github.com/farion1231/cc-switch)
 
-Proxy Center 的每个实例都是一个标准的 Anthropic Messages API 端点，可以直接作为 cc-switch 的自定义供应商接入：
+| 客户端 | 供应商配置 |
+| --- | --- |
+| Claude Code | 选择 Anthropic Messages，Base URL 填 `http://127.0.0.1:8766`，保存后启用供应商。 |
+| Codex | 在供应商高级选项中把上游格式设为 Anthropic Messages，Base URL 填 `http://127.0.0.1:8766`，并为 Codex 启用本地路由以转换请求格式。 |
+| OpenCode | 使用 `@ai-sdk/anthropic`，Base URL 填 `http://127.0.0.1:8766/v1`。添加供应商后，在 OpenCode 中选择该供应商的模型。 |
 
-1. 在实例配置页查看实例端点（`http://127.0.0.1:<端口>`）和 VK
-2. 打开 cc-switch，点击右上角 **+** 添加供应商
-3. 创建自定义配置：
-   - 名称：如 `OpenCANNBot 实例 1`
-   - Base URL（端点）：`http://127.0.0.1:8766`
-   - API Key：填写该实例的 VK
-4. 保存后在供应商列表中点击「启用」即可切换
-
-各应用的接入方式：
-
-| 应用 | 接入方式 |
-|------|----------|
-| Claude Code | 直接接入，实例原生提供 Anthropic Messages API；cc-switch 对 Claude Code 支持热切换，无需重启 |
-| Codex | Codex 原生走 OpenAI Responses 协议，需在 cc-switch 中开启本地代理（格式转换）后接入 |
-| OpenCode | 添加 Anthropic 类型自定义供应商（npm 填 `@ai-sdk/anthropic`），Base URL 和 API Key 同上 |
-
-说明：
-
-- 实例的模型由端口固定路由，cc-switch 供应商配置里的模型名不影响实际路由，生效的始终是实例所选模型
-- 除 Claude Code 外，切换供应商后需重启对应 CLI 终端才会生效（以 cc-switch 文档为准）
-- 若同时使用 cc-switch 的本地代理，注意其监听端口不要与实例端口（默认 8766–8768）或控制面板端口 8788 冲突
+使用 CC Switch 本地路由时，为它选用与面板和各实例不同的监听端口。[添加供应商](https://github.com/farion1231/cc-switch/blob/main/docs/user-manual/zh/2-providers/2.1-add.md) · [本地路由](https://github.com/farion1231/cc-switch/blob/main/docs/user-manual/zh/4-proxy/4.1-service.md)
 
 ## 数据位置
 
-```text
-%USERPROFILE%\.cannbot\proxy-center\config.json
-%USERPROFILE%\.cannbot\proxy-center\models-cache.json
-%USERPROFILE%\.cannbot\proxy-center\panel.log
-%USERPROFILE%\.cannbot\proxy-center\instances\<实例ID>\vk
-%USERPROFILE%\.cannbot\proxy-center\instances\<实例ID>\pid.json
-%USERPROFILE%\.cannbot\proxy-center\instances\<实例ID>\proxy.log
-```
+本地数据位于 `%USERPROFILE%\.cannbot\proxy-center`。
 
-不同实例使用隔离的运行 HOME，避免代理源码中的 `~/.cannbot/vk` 在多个进程之间互相覆盖。
+| 相对路径 | 内容 |
+| --- | --- |
+| `config.json` | 关联仓库路径、实例配置和模型列表 |
+| `models-cache.json` | 最近的网关同步结果 |
+| `panel.log` | 控制面板日志 |
+| `instances\<实例ID>\vk` | 实例 VK |
+| `instances\<实例ID>\pid.json` | 进程记录 |
+| `instances\<实例ID>\proxy.log` | 实例运行日志 |
+| `instances\<实例ID>\runtime-home\` | 实例独立的运行目录 |
+
+各实例的运行目录相互隔离，使上游代理分别读取自己的凭据文件。
 
 ## 从旧版升级
 
-直接使用相同安装目录执行 v6 的 `install.ps1` 即可覆盖程序文件。
+在新版源码目录运行 `.\install.ps1 -Overwrite`。原安装使用自定义目录或外部仓库时，通过 `-InstallDir` 或 `-RepoDir` 传入原路径。安装器会尝试停止旧进程并替换程序文件，保留 `%USERPROFILE%\.cannbot\proxy-center` 下的数据。
 
-首次运行时，如果尚未存在 v6 配置，程序会尝试迁移旧版：
-
-```text
-%USERPROFILE%\.cannbot\claude-panel.json
-%USERPROFILE%\.cannbot\vk
-```
-
-迁移后会生成一个默认实例。
+如果还没有 v6 配置，程序会尝试读取 `%USERPROFILE%\.cannbot\claude-panel.json`，并将旧版配置和可用的全局 VK 迁移到默认实例。
 
 ## 卸载
 
-保留配置、VK 和日志：
+在源码目录运行以下命令可卸载默认目录中的程序，并保留实例配置、VK 和日志。
 
 ```powershell
-.\uninstall.ps1 "C:\Tools\OpenCANNBotProxyCenter"
+.\uninstall.ps1
 ```
 
-连同代理中心的所有实例配置、VK 和日志一起删除：
+自定义安装目录通过 `-InstallDir` 指定。需要同时清除代理中心的本地数据时，使用 `-RemoveConfig`。
 
 ```powershell
-.\uninstall.ps1 "C:\Tools\OpenCANNBotProxyCenter" -RemoveConfig
+.\uninstall.ps1 -InstallDir "C:\Tools\OpenCANNBotProxyCenter" -RemoveConfig
 ```
 
-卸载会删除整个安装目录，包括安装时自动下载到其中的 `opencannbot\` 仓库。使用 `-RepoDir` 指定的外部仓库不受影响。
+卸载会删除整个安装目录，包括自动下载到其中的关联仓库。位于安装目录之外的关联仓库会保留。
 
 ## 特别感谢
 
-本项目的核心代理能力来自关联项目 [OpenCANNBot](https://github.com/BadFatCat0919/opencannbot)，Proxy Center 在其之上提供 Windows 原生的多实例管理。感谢 OpenCANNBot 项目的所有贡献者：
-
-**仓库地址：<https://github.com/BadFatCat0919/opencannbot>**
+本项目的核心代理能力来自关联项目 [OpenCANNBot](https://github.com/BadFatCat0919/opencannbot)，Proxy Center 在其之上提供 Windows 原生的多实例管理。感谢 OpenCANNBot 项目的所有贡献者。
 
 ## 许可证
 
